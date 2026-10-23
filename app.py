@@ -4,7 +4,7 @@ import re
 import json
 import html
 import concurrent.futures
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
@@ -498,63 +498,100 @@ def ingredient_in_lines(ingredient, lines):
 # 6. RECIPE PAGE IMAGE EXTRACTION
 # =========================================================
 
-def usable_url(value):
+def usable_url(value, base_url=None):
+    """Return an absolute http(s) URL, resolving relative paths."""
+    if isinstance(value, dict):
+        value = value.get("url") or value.get("contentUrl")
+
     if isinstance(value, str):
         value = value.strip()
+        if not value or value.startswith("data:"):
+            return None
         if value.startswith("//"):
             value = "https:" + value
-        if value.startswith("http://") or value.startswith("https://"):
+        elif base_url and not value.startswith(("http://", "https://")):
+            value = urljoin(base_url, value)
+        if value.startswith(("http://", "https://")):
             return value
+
     return None
 
 
-def get_image(recipe, soup, page_url):
-    """Try schema data, social image metadata, then recipe-page images."""
+def get_image_candidates(recipe, soup, page_url):
+    """Collect possible photo URLs: schema data, social tags, page images."""
+    candidates = []
+
+    def add(value):
+        url = usable_url(value, page_url)
+        if url and url not in candidates:
+            candidates.append(url)
+
     image = recipe.get("image")
-
     if isinstance(image, list):
-        image = image[0] if image else None
-
-    if isinstance(image, dict):
-        image = image.get("url") or image.get("contentUrl")
-
-    image_url = usable_url(image)
-    if image_url:
-        return image_url
+        for item in image:
+            add(item)
+    else:
+        add(image)
 
     for attribute, value in [
         ("property", "og:image"),
-        ("name", "twitter:image"),
         ("property", "og:image:secure_url"),
+        ("name", "twitter:image"),
     ]:
-        tag = soup.find("meta", attrs={attribute: value})
-        if tag:
-            image_url = usable_url(tag.get("content"))
-            if image_url:
-                return image_url
+        for tag in soup.find_all("meta", attrs={attribute: value}):
+            add(tag.get("content"))
 
-    # Prefer an image whose alt text resembles the recipe title.
     title = clean_text(recipe.get("name", ""))
 
     for img in soup.find_all("img"):
         alt = clean_text(img.get("alt", ""))
         src = (
-            img.get("src")
-            or img.get("data-src")
+            img.get("data-src")
             or img.get("data-lazy-src")
             or img.get("data-original")
+            or img.get("src")
         )
-        image_url = usable_url(src)
 
-        if image_url and title and alt and (
+        if src and title and alt and (
             title in alt or alt in title or any(
                 word in alt for word in
                 ["recipe", "curry", "rice", "paneer", "biryani"]
             )
         ):
-            return image_url
+            add(src)
 
-    return FALLBACK_IMAGE
+    return candidates[:6]
+
+
+def fetch_image(candidates, page_url):
+    """
+    Download the photo on the server. Many recipe sites block images that
+    are loaded straight from another website (hotlink protection), so the
+    app downloads the picture itself and shows the bytes.
+    Returns (image_url, image_bytes) or (None, None).
+    """
+    image_headers = dict(HEADERS)
+    image_headers["Referer"] = page_url
+    image_headers["Accept"] = "image/avif,image/webp,image/*,*/*;q=0.8"
+
+    for image_url in candidates:
+        try:
+            response = requests.get(
+                image_url, headers=image_headers, timeout=10
+            )
+            content_type = response.headers.get("Content-Type", "").lower()
+
+            if (
+                response.status_code == 200
+                and content_type.startswith("image/")
+                and "svg" not in content_type
+                and 2000 < len(response.content) < 6_000_000
+            ):
+                return image_url, response.content
+        except requests.RequestException:
+            continue
+
+    return None, None
 
 
 # =========================================================
@@ -682,13 +719,15 @@ def parse_recipe_page(url):
         if isinstance(servings, list):
             servings = servings[0] if servings else None
 
-        image = get_image(recipe, soup, url)
+        candidates = get_image_candidates(recipe, soup, url)
+        image_url, image_bytes = fetch_image(candidates, url)
 
         return {
             "title": html.unescape(str(title)).strip(),
             "url": clean_url(url),
             "source": urlparse(url).netloc.replace("www.", ""),
-            "image": image,
+            "image": image_url or (candidates[0] if candidates else None),
+            "image_bytes": image_bytes,
             "ingredients": ingredients,
             "instructions": instructions,
             "nutrition": nutrition,
@@ -1129,11 +1168,25 @@ if submitted:
 # 12. RECIPE CARDS
 # =========================================================
 
-def show_image(url):
-    try:
-        st.image(url, width="stretch")
-    except TypeError:
-        st.image(url, use_container_width=True)
+def show_image(recipe):
+    """Show the downloaded photo; fall back to its URL, then a stock photo."""
+    sources = [
+        recipe.get("image_bytes"),
+        recipe.get("image"),
+        FALLBACK_IMAGE,
+    ]
+
+    for source in sources:
+        if not source:
+            continue
+        try:
+            try:
+                st.image(source, width="stretch")
+            except TypeError:
+                st.image(source, use_container_width=True)
+            return
+        except Exception:
+            continue
 
 
 all_recipes = st.session_state.nutribowl_recipes
@@ -1168,7 +1221,7 @@ if all_recipes:
             image_col, detail_col = st.columns([0.9, 1.4], gap="large")
 
             with image_col:
-                show_image(recipe.get("image") or FALLBACK_IMAGE)
+                show_image(recipe)
 
             with detail_col:
                 st.markdown(f"### {number}. {md_safe(recipe['title'])}")
